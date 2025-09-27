@@ -1,0 +1,113 @@
+name: Reusable CD to AWS ECS
+
+on:
+  workflow_call:
+    inputs:
+      service:
+        description: "Service name (also used as container, ECS service, ECR repo)"
+        required: true
+        type: string
+      image_tag:
+        description: "Image tag (defaults to commit SHA)"
+        required: false
+        default: ${{ github.sha }}
+        type: string
+
+    secrets:
+      AWS_ACCESS_KEY_ID:
+        required: true
+      AWS_ACCESS_KEY_SECRET:
+        required: true
+
+jobs:
+  build-push-deploy:
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: ap-southeast-1
+      ECS_CLUSTER: prompttutor-cluster
+      ECR_REPOSITORY: ${{ inputs.service }}
+      ECS_SERVICE: ${{ inputs.service }}
+      CONTAINER_NAME: ${{ inputs.service }}
+      IMAGE_TAG: ${{ inputs.image_tag }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_ACCESS_KEY_SECRET }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Ensure ECR repository exists
+        run: |
+          aws ecr describe-repositories --repository-names "$ECR_REPOSITORY" >/dev/null 2>&1 || \
+          aws ecr create-repository --repository-name "$ECR_REPOSITORY" >/dev/null
+
+      - name: Build, tag, and push image
+        run: |
+          REGISTRY=${{ steps.login-ecr.outputs.registry }}
+          IMAGE_URI="$REGISTRY/$ECR_REPOSITORY"
+          echo "IMAGE_URI=$IMAGE_URI" >> $GITHUB_ENV
+
+          docker build -t "$IMAGE_URI:${{ env.IMAGE_TAG }}" -t "$IMAGE_URI:latest" .
+          docker push  "$IMAGE_URI:${{ env.IMAGE_TAG }}"
+          docker push  "$IMAGE_URI:latest"
+
+      # --- Deploy to ECS ---
+      - name: Read current task definition from service
+        id: read-td
+        run: |
+          SERVICE_TD_ARN=$(aws ecs describe-services \
+            --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE" \
+            --query 'services[0].taskDefinition' \
+            --output text)
+          echo "SERVICE_TD_ARN=$SERVICE_TD_ARN" >> $GITHUB_ENV
+
+          aws ecs describe-task-definition \
+            --task-definition "$SERVICE_TD_ARN" \
+            --query 'taskDefinition' > td.json
+
+          jq 'del(.status,.revision,.taskDefinitionArn,.requiresAttributes,.compatibilities,.registeredAt,.registeredBy)' td.json > td-stripped.json
+
+          if ! jq -e --arg n "$CONTAINER_NAME" '.containerDefinitions[] | select(.name==$n)' td-stripped.json >/dev/null; then
+            echo "Container '$CONTAINER_NAME' not found in task definition." >&2
+            jq -r '.containerDefinitions[].name' td-stripped.json >&2
+            exit 1
+          fi
+
+      - name: Swap image and register new task definition revision
+        id: register-td
+        run: |
+          jq --arg NAME "$CONTAINER_NAME" --arg IMG "$IMAGE_URI:${{ env.IMAGE_TAG }}" '
+            ( .containerDefinitions[] | select(.name==$NAME) ).image = $IMG
+            | .' td-stripped.json > td-new.json
+
+          NEW_TD_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://td-new.json \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+
+          echo "NEW_TD_ARN=$NEW_TD_ARN" >> $GITHUB_ENV
+          echo "Registered new task def: $NEW_TD_ARN"
+
+      - name: Update service to new task definition
+        run: |
+          aws ecs update-service \
+            --cluster "$ECS_CLUSTER" \
+            --service "$ECS_SERVICE" \
+            --task-definition "$NEW_TD_ARN" \
+            --force-new-deployment
+
+      - name: Wait for service stability
+        run: |
+          aws ecs wait services-stable \
+            --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE"
