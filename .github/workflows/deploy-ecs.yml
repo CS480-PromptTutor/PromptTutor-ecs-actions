@@ -12,6 +12,11 @@ on:
         required: false
         default: ${{ github.sha }}
         type: string
+      dockerfile:
+        description: "Base name of Dockerfile (e.g., 'prod' for prod.Dockerfile; blank = Dockerfile)"
+        required: false
+        default: ""
+        type: string
 
     secrets:
       AWS_ACCESS_KEY_ID:
@@ -29,6 +34,7 @@ jobs:
       ECS_SERVICE: ${{ inputs.service }}
       CONTAINER_NAME: ${{ inputs.service }}
       IMAGE_TAG: ${{ inputs.image_tag }}
+      DOCKERFILE_INPUT: ${{ inputs.dockerfile }}
 
     steps:
       - name: Checkout
@@ -56,9 +62,17 @@ jobs:
           IMAGE_URI="$REGISTRY/$ECR_REPOSITORY"
           echo "IMAGE_URI=$IMAGE_URI" >> $GITHUB_ENV
 
-          docker build -t "$IMAGE_URI:${{ env.IMAGE_TAG }}" -t "$IMAGE_URI:latest" .
-          docker push  "$IMAGE_URI:${{ env.IMAGE_TAG }}"
-          docker push  "$IMAGE_URI:latest"
+          # Select Dockerfile (fallback to Dockerfile if not provided or missing)
+          if [ -n "${DOCKERFILE_INPUT}" ] && [ -f "${DOCKERFILE_INPUT}.Dockerfile" ]; then
+            FILE="${DOCKERFILE_INPUT}.Dockerfile"
+          else
+            FILE="Dockerfile"
+          fi
+
+          echo "Using Dockerfile: $FILE"
+          docker build -f "$FILE" -t "$IMAGE_URI:${IMAGE_TAG}" -t "$IMAGE_URI:latest" .
+          docker push "$IMAGE_URI:${IMAGE_TAG}"
+          docker push "$IMAGE_URI:latest"
 
       # --- Deploy to ECS ---
       - name: Read current task definition from service
